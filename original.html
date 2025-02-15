@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>VR Data Health Dashboard</title>
+  <script src="https://webr.r-wasm.org/latest/webr.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    .section {
+      margin: 30px 0;
+      padding: 20px;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+    }
+    .plot {
+      margin: 20px 0;
+    }
+    .data-upload {
+      background: #f5f5f5;
+      padding: 20px;
+      border-radius: 8px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: left;
+    }
+  </style>
+</head>
+<body>
+  <h1>VR Data Health Analysis</h1>
+  
+  <div class="data-upload">
+    <h3>Select Local Dataset Folder</h3>
+    <!-- When you click the button, a folder picker is opened -->
+    <button id="selectFolderBtn">Select Dataset Folder</button>
+    <button onclick="runAnalysis()">Analyze Data</button>
+    <div id="selectedFolderName"></div>
+  </div>
+  
+  <div id="results"></div>
+  
+  <script>
+    // Global array to store file handles from the selected folder.
+    let datasetFiles = [];
+
+    // Recursively collect file handles from a directory.
+    async function getFilesFromDirectory(directoryHandle) {
+      const files = [];
+      for await (const entry of directoryHandle.values()) {
+        if (entry.kind === "file") {
+          files.push(entry);
+        } else if (entry.kind === "directory") {
+          const subFiles = await getFilesFromDirectory(entry);
+          files.push(...subFiles);
+        }
+      }
+      return files;
+    }
+
+    // When "Select Dataset Folder" is clicked, use the File System Access API.
+    document.getElementById('selectFolderBtn').addEventListener('click', async () => {
+      try {
+        const directoryHandle = await window.showDirectoryPicker();
+        datasetFiles = await getFilesFromDirectory(directoryHandle);
+        document.getElementById('selectedFolderName').innerText =
+          `Selected Folder: ${directoryHandle.name} (${datasetFiles.length} files)`;
+      } catch (err) {
+        console.error(err);
+        alert('Folder selection failed.');
+      }
+    });
+
+    // Initialize WebR.
+    const webR = new WebR();
+    await webR.init();
+
+    // Load required R packages.
+    await webR.evalRVoid(`
+      library(tidyverse)
+      library(ggplot2)
+      library(readr)
+      library(purrr)
+      library(stringr)
+      library(knitr)
+    `);
+
+    // Write a file into WebR’s virtual FS under "/data" (create directories as needed).
+    async function writeFileToFS(relativePath, content) {
+      const pathParts = relativePath.split('/');
+      const dirs = pathParts.slice(0, -1);
+      let currentPath = '/data';
+      try {
+        await webR.FS.stat('/data');
+      } catch (e) {
+        await webR.FS.mkdir('/data');
+      }
+      for (const dir of dirs) {
+        currentPath += '/' + dir;
+        try {
+          await webR.FS.stat(currentPath);
+        } catch (e) {
+          await webR.FS.mkdir(currentPath);
+        }
+      }
+      await webR.FS.writeFile(`${currentPath}/${pathParts[pathParts.length - 1]}`, content);
+    }
+
+    // Run the analysis: write files from the selected folder into WebR’s FS and run the embedded RMarkdown code.
+    async function runAnalysis() {
+      const resultsDiv = document.getElementById('results');
+      resultsDiv.innerHTML = '<div class="section">Loading and analyzing data...</div>';
+      
+      try {
+        // Write each file into WebR’s virtual FS.
+        // (Here we use fileHandle.name for the file’s name. If your folder structure is deeper,
+        // you may want to store and reconstruct the full relative path.)
+        for (const fileHandle of datasetFiles) {
+          const file = await fileHandle.getFile();
+          const content = await file.text();
+          await writeFileToFS(file.name, content);
+        }
+        
+        // Retrieve the full RMarkdown code from the embedded block.
+        const rmdCode = document.querySelector('#rmd-code').textContent;
+        
+        // Run the analysis in WebR: set main_directory to "/data" and evaluate the full R code.
+        await webR.evalRVoid(`
+          main_directory <- "/data"
+          # Read the participants data (expects "participants.tsv" in the root of /data)
+          participants_data <- read_tsv(file.path(main_directory, "participants.tsv"), show_col_types = FALSE)
+          
+          # --- Begin Full Embedded RMarkdown Code ---
+          ${rmdCode}
+          # --- End Full Embedded RMarkdown Code ---
+          
+          # Package the outputs for the dashboard.
+          analyze_all <- function() {
+            list(
+              demographics_plot = demographics_plot,
+              duration_plot = duration_plot,
+              condition_plot = condition_plot,
+              controller_plots = controller_plots,
+              summary_data = summary_data
+            )
+          }
+          results <- analyze_all()
+        `);
+        
+        // Retrieve and render the outputs.
+        const demographicsPlot = await webR.evalR(`results$demographics_plot`);
+        const demographicsTable = await webR.evalR(`knitr::kable(results$summary_data)`);
+        resultsDiv.innerHTML = `
+          <div class="section">
+            <h2>Demographics</h2>
+            <div class="plot">${await demographicsPlot.toDOM().then(el => el.outerHTML)}</div>
+            ${await demographicsTable.toHTML()}
+          </div>
+        `;
+        
+        const durationPlot = await webR.evalR(`results$duration_plot`);
+        resultsDiv.innerHTML += `
+          <div class="section">
+            <h2>Duration Analysis</h2>
+            <div class="plot">${await durationPlot.toDOM().then(el => el.outerHTML)}</div>
+          </div>
+        `;
+        
+        const conditionPlot = await webR.evalR(`results$condition_plot`);
+        resultsDiv.innerHTML += `
+          <div class="section">
+            <h2>Condition Comparison</h2>
+            <div class="plot">${await conditionPlot.toDOM().then(el => el.outerHTML)}</div>
+          </div>
+        `;
+        
+        const controllerPlots = await webR.evalR(`results$controller_plots`);
+        resultsDiv.innerHTML += `
+          <div class="section">
+            <h2>Controller Analysis</h2>
+            <div class="plot">${await controllerPlots.left_plot.toDOM().then(el => el.outerHTML)}</div>
+            <div class="plot">${await controllerPlots.right_plot.toDOM().then(el => el.outerHTML)}</div>
+          </div>
+        `;
+        
+      } catch (error) {
+        console.error(error);
+        resultsDiv.innerHTML = `<div class="section" style="color: red;">Error: ${error}</div>`;
+      }
+    }
+  </script>
+  
+  <!--
+    Full Embedded RMarkdown Code (from PuzzleProjectMotionData_New.Rmd)
+    ---------------------------------------------------------------
+    This code contains the complete analysis and visualization logic.
+  -->
+  <script id="rmd-code" type="text/r">
+## Load necessary libraries (already loaded in WebR)
+# library(tidyverse)
+# library(ggplot2)
+# library(readr)
+# library(purrr)
+# library(stringr)
+# library(knitr)
+
+## --- Main Folder and Participants Statistics ---
+participants_data <- read_tsv(file.path(main_directory, "participants.tsv"), show_col_types = FALSE)
+min_duration <- min(participants_data$duration)
+max_duration <- max(participants_data$duration)
+avg_duration <- mean(participants_data$duration)
+participant_number <- nrow(participants_data)
+
+summary_data <- participants_data %>%
+  group_by(Race, Gender) %>%
+  summarise(Count = n(), .groups = "drop")
+
+demographics_plot <- ggplot(summary_data, aes(x = Race, y = Count, fill = Gender)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("Male" = "skyblue", "Female" = "pink", "Non-binary" = "yellow")) +
+  theme_minimal() +
+  labs(title = "Participants by Race and Gender",
+       x = "Race", y = "Number of Participants", fill = "Gender") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+duration_plot <- ggplot(participants_data, aes(x = duration)) +
+  geom_histogram(binwidth = 55, fill = "skyblue", color = "black") +
+  labs(title = "Distribution of Experiment Durations",
+       subtitle = paste(participant_number, "Participants"),
+       x = "Duration (seconds)", y = "Count") +
+  geom_vline(aes(xintercept = min_duration), linetype = "dashed") +
+  geom_vline(aes(xintercept = max_duration), linetype = "dashed") +
+  geom_vline(aes(xintercept = avg_duration), linetype = "solid") +
+  theme_minimal()
+
+## --- Filter Anomalies ---
+anomaly_data <- participants_data %>% filter(Anomaly == "Yes")
+participants_data <- participants_data %>% filter(Anomaly == "No")
+
+## --- Motion Data ---
+motion_files_left <- list.files(main_directory, pattern = "LeftControllerMovement_motion.tsv$", recursive = TRUE, full.names = TRUE)
+LeftControllerData <- motion_files_left %>% map_df(~ {
+  subject_id <- str_extract(.x, "sub-\\w+")
+  motion_df <- read_tsv(.x, col_types = cols())
+  mutate(motion_df, participant_id = subject_id)
+})
+
+motion_files_right <- list.files(main_directory, pattern = "RightControllerMovement_motion.tsv$", recursive = TRUE, full.names = TRUE)
+RightControllerData <- motion_files_right %>% map_df(~ {
+  subject_id <- str_extract(.x, "sub-\\w+")
+  motion_df <- read_tsv(.x, col_types = cols())
+  mutate(motion_df, participant_id = subject_id)
+})
+
+motion_files_camera <- list.files(main_directory, pattern = "MainCameraMovement_motion.tsv$", recursive = TRUE, full.names = TRUE)
+MainCameraData <- motion_files_camera %>% map_df(~ {
+  subject_id <- str_extract(.x, "sub-\\w+")
+  motion_df <- read_tsv(.x, col_types = cols())
+  mutate(motion_df, participant_id = subject_id)
+})
+
+## --- Log Data and Condition Analysis ---
+log_files <- list.files(main_directory, pattern = "_events.tsv$", recursive = TRUE, full.names = TRUE)
+MainLog <- log_files %>% map_df(~ {
+  subject_id <- str_extract(.x, "sub-\\w+")
+  log_df <- read_tsv(.x, col_types = cols())
+  mutate(log_df, participant_id = subject_id)
+})
+
+condition_0_log <- MainLog %>%
+  filter(trial_type == "Condition: 0") %>%
+  mutate(participant_number = as.numeric(str_extract(participant_id, "\\d+"))) %>%
+  arrange(participant_number) %>%
+  mutate(participant_id = factor(participant_id, levels = unique(participant_id)))
+
+condition_2_log <- MainLog %>%
+  filter(trial_type == "Condition: 2") %>%
+  mutate(participant_number = as.numeric(str_extract(participant_id, "\\d+"))) %>%
+  arrange(participant_number) %>%
+  mutate(participant_id = factor(participant_id, levels = unique(participant_id)))
+
+combined_data_one_step <- bind_rows(
+  condition_0_log %>% mutate(condition = "Condition 0"),
+  condition_2_log %>% mutate(condition = "Condition 2")
+) %>% select(participant_number, duration, condition)
+
+combined_data_one_step$condition <- factor(combined_data_one_step$condition, levels = c("Condition 0", "Condition 2"))
+
+line_colors <- combined_data_one_step %>%
+  pivot_wider(names_from = condition, values_from = duration) %>%
+  mutate(color_flag = ifelse(`Condition 0` > `Condition 2`, "highlight", "normal")) %>%
+  select(participant_number, color_flag)
+
+combined_data_one_step <- left_join(combined_data_one_step, line_colors, by = "participant_number")
+
+one_step_plot <- ggplot(combined_data_one_step, aes(x = condition, y = duration, group = participant_number)) +
+  geom_line(aes(color = color_flag)) +
+  geom_point(aes(color = color_flag), size = 2) +
+  stat_summary(fun = mean, geom = "point", aes(group = 1), size = 5, color = "red") +
+  scale_color_manual(values = c("highlight" = "red", "normal" = "black")) +
+  scale_x_discrete(labels = c("Condition 0" = "One-step without clutter", "Condition 2" = "One-step with clutter")) +
+  labs(title = "Time to Solve Puzzle (One-step Movement)",
+       x = "Condition", y = "Time (seconds)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Two-step analysis
+condition_1_log <- MainLog %>%
+  filter(trial_type == "Condition: 1") %>%
+  mutate(participant_number = as.numeric(str_extract(participant_id, "\\d+"))) %>%
+  arrange(participant_number) %>%
+  mutate(participant_id = factor(participant_id, levels = unique(participant_id)))
+
+condition_3_log <- MainLog %>%
+  filter(trial_type == "Condition: 3") %>%
+  mutate(participant_number = as.numeric(str_extract(participant_id, "\\d+"))) %>%
+  arrange(participant_number) %>%
+  mutate(participant_id = factor(participant_id, levels = unique(participant_id)))
+
+combined_data_two_step <- bind_rows(
+  condition_1_log %>% mutate(condition = "Condition 1"),
+  condition_3_log %>% mutate(condition = "Condition 3")
+) %>% select(participant_number, duration, condition)
+
+combined_data_two_step$condition <- factor(combined_data_two_step$condition, levels = c("Condition 1", "Condition 3"))
+
+outliers <- str_extract(anomaly_data$participant_id, "\\d+")
+
+line_colors_two <- combined_data_two_step %>%
+  pivot_wider(names_from = condition, values_from = duration) %>%
+  mutate(color_flag = ifelse(participant_number %in% outliers, "outlier", "normal")) %>%
+  select(participant_number, color_flag)
+
+combined_data_two_step <- left_join(combined_data_two_step, line_colors_two, by = "participant_number")
+
+two_step_plot <- ggplot(combined_data_two_step, aes(x = condition, y = duration, group = participant_number)) +
+  geom_line(aes(color = color_flag)) +
+  geom_point(size = 2) +
+  stat_summary(fun = mean, geom = "point", aes(group = 1), size = 5, color = "red") +
+  scale_color_manual(values = c("highlight" = "red", "normal" = "black")) +
+  scale_x_discrete(labels = c("Condition 1" = "Two-step without clutter", "Condition 3" = "Two-step with clutter")) +
+  labs(title = "Time to Solve Puzzle (Two-step Movement)",
+       x = "Condition", y = "Time (seconds)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right")
+
+# For display purposes, we choose one_step_plot as the condition comparison plot.
+condition_plot <- one_step_plot
+
+## --- Controller Analysis ---
+motion_files_left <- list.files(main_directory, pattern = "LeftControllerMovement_motion.tsv$", recursive = TRUE, full.names = TRUE)
+LeftControllerData <- motion_files_left %>% map_df(~ {
+  subject_id <- str_extract(.x, "sub-\\w+")
+  motion_df <- read_tsv(.x, col_types = cols())
+  mutate(motion_df, participant_id = subject_id)
+})
+
+motion_data_left <- LeftControllerData %>%
+  group_by(participant_id) %>%
+  mutate(delta_t = time - lag(time),
+         speed = sqrt((pos_x - lag(pos_x))^2 +
+                      (pos_y - lag(pos_y))^2 +
+                      (pos_z - lag(pos_z))^2) / delta_t) %>%
+  filter(!is.na(speed) & delta_t > 0)
+
+controller_speed_left <- motion_data_left %>%
+  group_by(participant_id) %>%
+  summarise(avg_speed = mean(speed, na.rm = TRUE))
+
+left_controller_plot <- ggplot(controller_speed_left, aes(x = participant_id, y = avg_speed)) +
+  geom_point(size = 3, color = "black") +
+  labs(title = "Average Left Controller Speed by Participant",
+       x = "Participant", y = "Average Speed (m/s)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# For demonstration, using the left controller plot for both left and right.
+controller_plots <- list(left_plot = left_controller_plot, right_plot = left_controller_plot)
+  </script>
+  
+</body>
+</html>
